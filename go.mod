@@ -1,3 +1,3 @@
-module github.com/rexagamer/faultwire
+module faultwire
 
 go 1.25.0

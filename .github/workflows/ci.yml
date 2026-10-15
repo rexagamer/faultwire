@@ -1,0 +1,35 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-and-build:
+    name: Go Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run unit tests with race detector
+        run: go test -v -race ./...
+
+      - name: Build FaultWire CLI and Chaos Arena
+        run: |
+          go build -v ./cmd/faultwire
+          go build -v ./cmd/arena
+
+      - name: Execute Chaos Arena Determinism Check
+        run: go run ./cmd/arena/main.go
