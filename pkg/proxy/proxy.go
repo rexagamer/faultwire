@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"faultwire/pkg/engine"
+	"github.com/rexagamer/faultwire/pkg/engine"
 )
 
 // Config defines the runtime configuration for the FaultWire proxy server.

@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"faultwire/pkg/engine"
-	"faultwire/pkg/proxy"
+	"github.com/rexagamer/faultwire/pkg/engine"
+	"github.com/rexagamer/faultwire/pkg/proxy"
 )
 
 func main() {
