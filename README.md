@@ -62,7 +62,7 @@ faultwire/
 ### 1. Clone and Build
 
 ```bash
-git clone [https://github.com/](https://github.com/)rexagamer/faultwire.git
+git clone https://github.com/rexagamer/faultwire.git
 cd faultwire
 go build -o faultwire ./cmd/faultwire
 ```
