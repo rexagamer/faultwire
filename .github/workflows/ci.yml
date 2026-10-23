@@ -36,8 +36,13 @@ jobs:
             exit 1
           fi
 
-      - name: Run unit & race tests
+      - name: Run unit & race tests (Linux)
+        if: runner.os == 'Linux'
         run: go test -v -race ./...
+
+      - name: Run unit tests (macOS & Windows)
+        if: runner.os != 'Linux'
+        run: go test -v ./...
 
       - name: Run engine fuzz testing
         shell: bash

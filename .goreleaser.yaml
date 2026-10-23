@@ -40,6 +40,8 @@ dockers:
       - "ghcr.io/rexagamer/faultwire:{{ .Tag }}"
       - "ghcr.io/rexagamer/faultwire:latest"
     dockerfile: Dockerfile
+    goos: linux
+    goarch: amd64
     build_flag_templates:
       - "--pull"
       - "--label=org.opencontainers.image.title={{ .ProjectName }}"
