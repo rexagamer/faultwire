@@ -30,7 +30,11 @@ jobs:
         shell: bash
         run: |
           go mod tidy
-          git diff --exit-code go.mod go.sum
+          git diff --exit-code go.mod
+          if [ -f go.sum ]; then
+            echo "Error: external dependencies detected! go.sum must not exist."
+            exit 1
+          fi
 
       - name: Run unit & race tests
         run: go test -v -race ./...
