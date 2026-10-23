@@ -4,7 +4,7 @@ import "sync"
 
 const DefaultBufferSize = 32 * 1024 // 32 KB
 
-// BufferPool manages pre-allocated byte slices to achieve zero-allocation transfers.
+// BufferPool manages pre-allocated byte slices to eliminate GC allocation on hot paths.
 type BufferPool struct {
 	pool sync.Pool
 	size int

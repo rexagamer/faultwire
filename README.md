@@ -1,191 +1,237 @@
 ﻿# FaultWire
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#architecture--data-path)
+[![Go Reference](https://pkg.go.dev/badge/github.com/rexagamer/faultwire.svg)](https://pkg.go.dev/github.com/rexagamer/faultwire)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#architecture)
 [![CI Status](https://github.com/rexagamer/faultwire/actions/workflows/ci.yml/badge.svg)](https://github.com/rexagamer/faultwire/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**FaultWire** is a deterministic, zero-dependency Layer 4 TCP fault-injection proxy written in Go. 
+**FaultWire** is a deterministic, zero-dependency Layer 4 TCP fault-injection proxy written in Go.
 
-Distributed systems rarely fail in clean, reproducible ways. When an application crashes in production due to a half-open socket, bit-flipped packet, or sudden latency spike, reproducing that exact failure locally is nearly impossible. FaultWire sits between your client and backend services, intercepting raw TCP byte streams and injecting **seeded, deterministic network chaos**—allowing engineers to replay exact failure sequences on demand.
+Distributed systems rarely fail in clean, reproducible ways. When production systems crash from half-open sockets, bit-flipped wire payloads, unhandled packet fragmentation, or latency spikes, reproducing that exact failure sequence locally is notoriously difficult. FaultWire sits between client applications and backend services, intercepting raw TCP byte streams and injecting **seeded, deterministic network chaos**—allowing engineering teams to replay exact failure sequences on demand.
 
 ---
 
-## Architecture & Data Path
+## Why FaultWire?
 
-FaultWire operates transparently at the transport layer (TCP), making it completely language- and protocol-agnostic. It works out of the box with HTTP, gRPC, PostgreSQL, Redis, or custom binary wire protocols without modifying a single line of application code.
+| Capability | FaultWire | Shopify Toxiproxy | Chaos Mesh |
+|---|---|---|---|
+| **Zero Dependencies** | Yes (pure Go standard library) | No (external runtime) | No (requires Kubernetes) |
+| **Deterministic PRNG Replay** | Yes (`--seed 42`) | No | No |
+| **Kernel `TCP RST` Injection** | Yes (`SO_LINGER=0`) | Partial | Yes (iptables/eBPF) |
+| **In-Flight Bit-Flipping** | Yes (in-place XOR mutation) | No | No |
+| **Bandwidth Throttling** | Yes (Token Bucket) | Yes | Yes |
+| **Live Control REST API** | Yes (`:8081`) | Yes | Yes |
+| **Testing Harness** | Native Go `testing.TB` integration | External client required | CRD / YAML definitions |
+| **Binary Footprint** | ~7 MB static scratch binary | Variable | Complex cluster controller |
+
+---
+
+## Architecture
+
+FaultWire operates transparently at the transport layer (TCP), making it completely protocol-agnostic. It works out of the box with HTTP/1.1, HTTP/2, gRPC, PostgreSQL, MySQL, Redis, Kafka, and custom binary wire protocols.
 
 ```text
 +-------------------+         +---------------------------------------------------+         +-------------------+
 |                   |         |                  FaultWire Proxy                  |         |                   |
-|   Client / App    | ======> |  [32KB sync.Pool] ---> [Seeded PRNG Fault Engine] | ======> |  Upstream Server  |
-|  (Python, Go, JS) |  TCP    |                                 |                 |  TCP    | (API, DB, Redis)  |
-|                   | <====== |  [Lock-Free Atomics] <----------+                 | <====== |                   |
+|   Client / App    | ======> |  [sync.Pool 32KB] ---> [Seeded Inbound Engine]    | ======> |  Upstream Server  |
+|  (Python, Go, JS) |   TCP   |                                                   |   TCP   | (API, DB, Redis)  |
+|                   | <====== |  [Token-Bucket Limiter] <--- [Outbound Engine]    | <====== |                   |
 +-------------------+         +---------------------------------------------------+         +-------------------+
-                                                                |
-                                       +------------------------+------------------------+
-                                       |                        |                        |
-                                       v                        v                        v
-                                [TCP RST Drop]          [XOR Bit-Flip]          [Jitter / Slice]
-                                (SO_LINGER = 0)        (In-Place Mutate)        (Context Timer)
+                                                        |
+                                       +----------------+----------------+
+                                       |                |                |
+                                       v                v                v
+                                [TCP RST Drop]   [XOR Bit-Flip]   [Jitter / Slice]
+                                (SO_LINGER = 0)  (In-Place XOR)   (Context Timer)
 ```
 
-### Engineering Highlights
+### Key Engineering Highlights
 
-* **100% Deterministic Chaos Replay:** Powered by an isolated, mutex-guarded pseudo-random number generator (`math/rand.Source`). Feeding FaultWire `--seed 42` guarantees the exact same sequence of packet drops, bit-flips, and millisecond delays across test runs.
-* **Kernel-Level `TCP RST` Injection:** Instead of closing connections politely with a standard 4-way `FIN` handshake, dropped connections configure socket `SO_LINGER` to `0` (`SetLinger(0)`), forcing the OS kernel to purge send buffers and fire an immediate `TCP RST` (`Connection reset by peer`) packet.
-* **In-Flight Bitwise Payload Corruption:** Simulates hardware line noise and faulty NICs by performing in-place bitwise `XOR` mutations on raw TCP byte slices before forwarding.
-* **TCP Packet Fragmentation:** Splits single TCP writes into multiple delayed sub-slices to expose broken framing assumptions and incomplete `io.Reader` loops in upstream parsers.
-* **Zero-Allocation Hot Path:** Reuses fixed 32 KB socket buffers via `sync.Pool` pointers (`*[]byte`), avoiding garbage collection pressure under high throughput.
-* **Lock-Free Telemetry:** Tracks active connections, byte throughput, and fault distribution counters in real time using `sync/atomic` primitives.
+- **100% Deterministic Chaos Replay:** Powered by an isolated pseudo-random number generator (`math/rand.Source`) guarded by mutex locking. Supplying `--seed 42` guarantees the exact same sequence of packet drops, bit-flips, and delays across test runs.
+- **Bi-Directional Pipeline Control:** Inbound (`Client -> Upstream`) and outbound (`Upstream -> Client`) traffic flows pass through dedicated fault engines, allowing you to test client behavior against corrupted responses or dropped ACKs independently.
+- **Kernel-Level `TCP RST` Injection:** Dropped connections set socket `SO_LINGER` to `0` (`SetLinger(0)`), instructing the operating system kernel to purge send buffers and fire an immediate `TCP RST` (`Connection reset by peer`) instead of a polite 4-way `FIN` handshake.
+- **In-Flight Bitwise Payload Mutation:** Performs bitwise XOR manipulations directly on byte slices to simulate noisy network hardware and faulty NICs while keeping printable ASCII characters readable in logs.
+- **Packet Slicing / Fragmentation:** Splits single writes into multiple delayed sub-chunks to expose broken framing assumptions and incomplete `io.Reader` buffering in parsers.
+- **Bandwidth Throttling:** Built-in token-bucket rate limiter to emulate bandwidth-constrained networks (2G/3G, satellite WAN).
+- **Zero-Allocation Hot Path:** Recycles 32 KB socket buffers using `sync.Pool` pointers, avoiding GC churn under high throughput.
+- **Lock-Free Telemetry:** Real-time counters tracked with `sync/atomic` primitives.
 
 ---
 
-## Project Structure
+## Installation
 
-```text
-faultwire/
-├── cmd/
-│   ├── faultwire/       # Production CLI proxy server with live atomic telemetry
-│   └── arena/           # Self-contained High-Frequency Trading chaos & replay simulator
-├── pkg/
-│   ├── engine/          # Deterministic PRNG fault engine, atomic metrics & unit tests
-│   └── proxy/           # Full-duplex TCP interceptor, SO_LINGER RST handler & buffer pool
-└── examples/
-    └── python/          # Real-world Python Payment API & Client resilience testbed
+### Pre-Built Binaries
+Download pre-compiled static binaries for Linux, macOS, and Windows from [GitHub Releases](https://github.com/rexagamer/faultwire/releases).
+
+### Docker Container
+```bash
+docker pull ghcr.io/rexagamer/faultwire:latest
+```
+
+### Go Install
+```bash
+go install github.com/rexagamer/faultwire/cmd/faultwire@latest
 ```
 
 ---
 
 ## Quickstart
 
-### 1. Clone and Build
+### 1. Run the CLI Proxy
+Start a proxy listening on `:8000` forwarding to PostgreSQL or an API on `:9000`, injecting 20% drops, 25% bit-flips, and 200ms latency:
 
 ```bash
-git clone https://github.com/rexagamer/faultwire.git
-cd faultwire
-go build -o faultwire ./cmd/faultwire
-```
-
-### 2. Run the Chaos Arena Simulator
-
-FaultWire includes a built-in **Chaos Arena** (`cmd/arena/main.go`) that spins up a mock financial exchange, places FaultWire in the middle with `Seed 42`, fires 12 sequential trade orders, and then resets the seed to verify **100% deterministic fault replay**:
-
-```bash
-go run ./cmd/arena/main.go
-```
-
-**Sample Output:**
-```text
-==========================================================================================
-   FAULTWIRE CHAOS ARENA: HIGH-FREQUENCY TRADING RESILIENCE & DETERMINISM SIMULATOR
-==========================================================================================
-Backend Exchange : 127.0.0.1:61043
-FaultWire Proxy  : 127.0.0.1:61044 (Seed: 42 | Drop: 20% | Corrupt: 25% | Delay: 25%)
-
->>> EXECUTING RUN #1 (SEED 42)
-------------------------------------------------------------------------------------------
-Order #01 |    1ms | CORRUPTED (BITFLIP)  | ERR_CORRUPT: Silent Data Mutation! Symbol="BTC-USD" Action="BEY"
-Order #02 |    1ms | CORRUPTED (BITFLIP)  | ERR_CORRUPT: JSON Parse Failed -> Raw Wire Bytes: {"order_id":2,"symbol":"BTC-USD","action#:"BUY","amount":2000}
-Order #03 |    1ms | HEALTHY (PASS)       | ACK: Executed BUY BTC-USD ($3000)
-Order #04 |    1ms | CORRUPTED (BITFLIP)  | ERR_CORRUPT: JSON Parse Failed -> Raw Wire Bytes: {"order_id"24,"symbol":"BTC-USD","action":"BUY","amount":4000}
-Order #05 |   11ms | HEALTHY (PASS)       | ACK: Executed BUY BTC-USD ($5000)
-Order #06 |    1ms | HEALTHY (PASS)       | ACK: Executed BUY BTC-USD ($6000)
-Order #07 |  244ms | DELAYED (JITTER)     | ACK: Executed BUY BTC-USD ($7000)
-Order #08 |   11ms | HEALTHY (PASS)       | ACK: Executed BUY BTC-USD ($8000)
-Order #09 |    1ms | HEALTHY (PASS)       | ACK: Executed BUY BTC-USD ($9000)
-Order #10 |    1ms | DROPPED (TCP RST)    | Socket severed mid-flight (TCP RST)
-Order #11 |    1ms | CORRUPTED (BITFLIP)  | ERR_CORRUPT: Silent Data Mutation! Symbol="BTC-TSD" Action="BUY"
-Order #12 |  237ms | DELAYED (JITTER)     | ACK: Executed BUY BTC-USD ($12000)
-
->>> REPLAYING RUN #2 WITH IDENTICAL SEED (SEED 42)
-------------------------------------------------------------------------------------------
-Order #01 |    1ms | CORRUPTED (BITFLIP)  | ERR_CORRUPT: Silent Data Mutation! Symbol="BTC-USD" Action="BEY"
-...
-Order #12 |  237ms | DELAYED (JITTER)     | ACK: Executed BUY BTC-USD ($12000)
-
-==========================================================================================
- [SUCCESS] DETERMINISM VERIFIED: Run #1 and Run #2 produced the EXACT same fault sequence!
-==========================================================================================
-```
-
----
-
-## Real-World Case Study: Breaking a Python Payment Service
-
-Because FaultWire operates on raw TCP sockets, you can place it in front of any backend service to uncover hidden distributed systems bugs.
-
-### Step 1: Start the Target Backend (`:9000`)
-```bash
-python examples/python/backend.py
-```
-
-### Step 2: Start FaultWire Proxy (`:8000 -> :9000`)
-Configure a 20% `TCP RST` drop rate, 20% bit-flip corruption rate, and 30% latency jitter (100ms–500ms) using deterministic seed `77`:
-```bash
-go run ./cmd/faultwire/main.go \
+faultwire \
   -listen :8000 \
   -upstream 127.0.0.1:9000 \
-  -seed 77 \
-  -drop 0.2 \
-  -corrupt 0.2 \
-  -delay 0.3 \
+  -control :8081 \
+  -seed 42 \
+  -drop 0.20 \
+  -corrupt 0.25 \
+  -delay 0.20 \
   -min-delay 100ms \
-  -max-delay 500ms
+  -max-delay 300ms
 ```
 
-### Step 3: Run the Client Against FaultWire (`:8000`)
+### 2. Run with Built-in Chaos Presets
+Use curated profiles without configuring individual fault percentages:
+
 ```bash
-python examples/python/client.py
+faultwire -upstream 127.0.0.1:9000 -profile mobile-flaky -seed 42
 ```
 
-### Bugs Exposed by FaultWire in One Run:
-
-1. **The "Ghost Charge" Double-Billing Bug (Payments #03, #04, #10):**
-   * **Client Output:** `Payment #03 | 308ms | FAILED | Network Failure: TimeoutError: timed out`
-   * **FaultWire Log:** `[CHAOS] CLIENT->UPSTREAM | Injecting latency jitter: 466.612806ms`
-   * **Backend Log:** `[PYTHON BACKEND] Processed payment: User=alice, Amount=$300`
-   * **Insight:** The client timed out at `300ms` and reported a failure to the user, but the delayed packet still reached the backend at `466ms` and charged the customer—proving the backend requires idempotency keys.
-
-2. **Wire-Level Byte Corruption (Payment #09):**
-   * **FaultWire Log:** `[CHAOS] CLIENT->UPSTREAM | Bit-flip at byte[189]: 0x22 -> 0x02`
-   * **Backend Log:** `[PYTHON BACKEND] CRASH! Invalid payload received: b'{"user": "alice\x02, "amount": 900}'`
-   * **Insight:** FaultWire flipped a single bit inside the closing quote (`0x22`), exposing how the backend handles malformed wire payloads.
-
-3. **Abrupt Mid-Stream Disconnects (Payments #02, #08):**
-   * **FaultWire Log:** `[CHAOS] CLIENT->UPSTREAM | Severing connection with TCP RST (32 bytes dropped)`
-   * **Client/Backend Output:** `ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host`
-   * **Insight:** FaultWire allowed the HTTP headers through, then injected a `TCP RST` right as the 32-byte JSON body arrived, testing whether the server leaks file descriptors on half-read sockets.
+Available presets:
+- `mobile-flaky`: High jitter (150ms–600ms), 10% drops, 3% bit-flips, 15% packet slicing.
+- `cross-region-wan`: Constant 120ms–220ms latency jitter, 2% drops.
+- `nic-fault`: Hardware-level corruption with 30% payload bit-flips and 15% RST aborts.
+- `high-jitter`: 50% chance of random delay spikes between 10ms and 800ms.
 
 ---
 
-## CLI Configuration Flags
+## First-Class Go Integration Testing
+
+FaultWire provides an in-memory test harness (`pkg/faultwiretest`) designed to bind directly to Go's `testing.TB` lifecycle:
+
+```go
+package myapp_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/rexagamer/faultwire/pkg/faultwiretest"
+)
+
+func TestPaymentClient_CircuitBreakerUnderPartitions(t *testing.T) {
+	upstreamDB := "127.0.0.1:5432"
+
+	// Start ephemeral proxy tied to the test lifecycle
+	proxy := faultwiretest.NewServer(t, upstreamDB,
+		faultwiretest.WithSeed(42),
+		faultwiretest.WithDropRate(0.40), // 40% TCP RST drop rate
+		faultwiretest.WithDelay(50*time.Millisecond, 150*time.Millisecond, 0.30),
+	)
+
+	// Route your application client through proxy.Addr()
+	client := NewClient(proxy.Addr())
+	err := client.ExecuteTransaction()
+	if err != nil {
+		t.Logf("Client handled network partition cleanly: %v", err)
+	}
+
+	// Rewind the PRNG stream to step 0 for an identical replay
+	proxy.Reset()
+}
+```
+
+---
+
+## Dynamic Runtime Control REST API
+
+FaultWire embeds an HTTP management interface (default `:8081`) allowing test runners and CI/CD jobs to reconfigure or inspect chaos parameters without restarting the proxy:
+
+### Inspect Live Metrics
+```bash
+curl http://localhost:8081/metrics
+```
+```json
+{
+  "inbound": {
+    "bytes_forwarded": 512044,
+    "active_conns": 3,
+    "total_conns": 64,
+    "drops": 8,
+    "corruptions": 14,
+    "delays": 19,
+    "fragments": 6
+  },
+  "outbound": {
+    "bytes_forwarded": 1048576,
+    "active_conns": 3,
+    "total_conns": 64,
+    "drops": 0,
+    "corruptions": 0,
+    "delays": 0,
+    "fragments": 0
+  }
+}
+```
+
+### Mutate Fault Rates On the Fly
+```bash
+curl -X POST http://localhost:8081/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inbound": {
+      "seed": 9999,
+      "drop_rate": 0.50,
+      "corrupt_rate": 0.10,
+      "delay_rate": 0.20,
+      "min_delay": 50000000,
+      "max_delay": 200000000
+    }
+  }'
+```
+
+### Reset Seed State for Replay
+```bash
+curl -X POST http://localhost:8081/reset
+```
+
+---
+
+## CLI Configuration Reference
 
 | Flag | Default | Description |
 |---|---|---|
-| `-listen` | `:8000` | Local TCP address and port for FaultWire to bind and listen on. |
-| `-upstream` | `127.0.0.1:9000` | Target upstream TCP address to forward traffic to. |
-| `-seed` | `1337` | Deterministic PRNG seed for reproducible fault sequences. |
-| `-drop` | `0.0` | Probability (`0.0` to `1.0`) of severing a connection via kernel `TCP RST`. |
-| `-corrupt` | `0.0` | Probability (`0.0` to `1.0`) of flipping a random bit in the TCP payload. |
-| `-delay` | `0.0` | Probability (`0.0` to `1.0`) of injecting latency jitter before forwarding. |
-| `-fragment` | `0.0` | Probability (`0.0` to `1.0`) of slicing a TCP chunk into two delayed writes. |
-| `-min-delay` | `50ms` | Minimum duration for injected latency jitter. |
-| `-max-delay` | `400ms` | Maximum duration for injected latency jitter. |
-| `-verbose` | `true` | Log every intercepted chaos decision in real time. |
+| `-listen` | `:8000` | Local TCP address to bind the proxy server. |
+| `-upstream` | `127.0.0.1:9000` | Target upstream TCP service address. |
+| `-control` | `:8081` | Bind address for the HTTP control plane (empty to disable). |
+| `-config` | `""` | Path to optional JSON configuration file. |
+| `-profile` | `""` | Pre-configured chaos preset (`mobile-flaky`, `cross-region-wan`, `nic-fault`, `high-jitter`). |
+| `-seed` | `1337` | Deterministic PRNG seed for reproducible chaos sequencing. |
+| `-drop` | `0.0` | Probability (`0.0` to `1.0`) of severing connection via kernel `TCP RST`. |
+| `-corrupt` | `0.0` | Probability (`0.0` to `1.0`) of flipping a bit in the TCP payload. |
+| `-delay` | `0.0` | Probability (`0.0` to `1.0`) of injecting latency jitter. |
+| `-fragment` | `0.0` | Probability (`0.0` to `1.0`) of slicing TCP packets into delayed chunks. |
+| `-min-delay` | `50ms` | Minimum duration for latency jitter. |
+| `-max-delay` | `400ms` | Maximum duration for latency jitter. |
+| `-bandwidth-kb` | `0` | Bandwidth throttle limit in KB/second (`0` = unlimited). |
+| `-verbose` | `true` | Log chaos decisions in real time. |
 
 ---
 
-## Running Automated Tests
+## Automated Chaos Arena Simulator
 
-FaultWire includes unit tests verifying PRNG determinism and concurrency safety under Go's race detector:
+FaultWire includes a self-contained demonstration simulator (`cmd/arena/main.go`) that starts a mock financial exchange, fires a series of JSON trade orders through aggressive chaos injection, and then resets the seed to prove 100% bit-level reproducibility:
 
 ```bash
-go test -v -race ./...
+go run ./cmd/arena/main.go
 ```
 
 ---
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.

@@ -37,16 +37,16 @@ func (a Action) String() string {
 
 // Config holds the deterministic chaos parameters.
 type Config struct {
-	Seed         int64
-	DropRate     float64       // 0.0 to 1.0
-	CorruptRate  float64       // 0.0 to 1.0
-	DelayRate    float64       // 0.0 to 1.0
-	FragmentRate float64       // 0.0 to 1.0
-	MinDelay     time.Duration // Minimum latency injection
-	MaxDelay     time.Duration // Maximum latency injection
+	Seed         int64         `json:"seed"`
+	DropRate     float64       `json:"drop_rate"`     // 0.0 to 1.0
+	CorruptRate  float64       `json:"corrupt_rate"`  // 0.0 to 1.0
+	DelayRate    float64       `json:"delay_rate"`    // 0.0 to 1.0
+	FragmentRate float64       `json:"fragment_rate"` // 0.0 to 1.0
+	MinDelay     time.Duration `json:"min_delay"`     // Minimum latency injection
+	MaxDelay     time.Duration `json:"max_delay"`     // Maximum latency injection
 }
 
-// Decision contains the pre-computed fault parameters for a single chunk.
+// Decision contains pre-computed fault instructions for a chunk.
 type Decision struct {
 	Action        Action
 	Delay         time.Duration
@@ -57,18 +57,31 @@ type Decision struct {
 
 // Metrics tracks real-time proxy telemetry using lock-free atomic counters.
 type Metrics struct {
-	BytesForwarded  atomic.Uint64
-	ActiveConns     atomic.Int64
-	TotalConns      atomic.Uint64
-	ChunksEvaluated atomic.Uint64
-	Passes          atomic.Uint64
-	Drops           atomic.Uint64
-	Corruptions     atomic.Uint64
-	Delays          atomic.Uint64
-	Fragments       atomic.Uint64
+	BytesForwarded  atomic.Uint64 `json:"bytes_forwarded"`
+	ActiveConns     atomic.Int64  `json:"active_conns"`
+	TotalConns      atomic.Uint64 `json:"total_conns"`
+	ChunksEvaluated atomic.Uint64 `json:"chunks_evaluated"`
+	Passes          atomic.Uint64 `json:"passes"`
+	Drops           atomic.Uint64 `json:"drops"`
+	Corruptions     atomic.Uint64 `json:"corruptions"`
+	Delays          atomic.Uint64 `json:"delays"`
+	Fragments       atomic.Uint64 `json:"fragments"`
 }
 
-// Engine drives deterministic fault injection.
+// Snapshot exports metrics into a clean serializable structure.
+type MetricsSnapshot struct {
+	BytesForwarded  uint64 `json:"bytes_forwarded"`
+	ActiveConns     int64  `json:"active_conns"`
+	TotalConns      uint64 `json:"total_conns"`
+	ChunksEvaluated uint64 `json:"chunks_evaluated"`
+	Passes          uint64 `json:"passes"`
+	Drops           uint64 `json:"drops"`
+	Corruptions     uint64 `json:"corruptions"`
+	Delays          uint64 `json:"delays"`
+	Fragments       uint64 `json:"fragments"`
+}
+
+// Engine executes deterministic fault decisions.
 type Engine struct {
 	mu      sync.Mutex
 	rng     *rand.Rand
@@ -76,28 +89,65 @@ type Engine struct {
 	Metrics Metrics
 }
 
-// New creates a seeded FaultWire decision engine.
+// New creates an Engine instance.
 func New(cfg Config) *Engine {
-	if cfg.MinDelay <= 0 {
-		cfg.MinDelay = 50 * time.Millisecond
-	}
-	if cfg.MaxDelay < cfg.MinDelay {
-		cfg.MaxDelay = cfg.MinDelay
-	}
+	normalizeConfig(&cfg)
 	return &Engine{
 		rng: rand.New(rand.NewSource(cfg.Seed)),
 		cfg: cfg,
 	}
 }
 
-// Reset re-initializes the PRNG with its original seed for deterministic replay.
+func normalizeConfig(cfg *Config) {
+	if cfg.MinDelay <= 0 {
+		cfg.MinDelay = 50 * time.Millisecond
+	}
+	if cfg.MaxDelay < cfg.MinDelay {
+		cfg.MaxDelay = cfg.MinDelay
+	}
+}
+
+// UpdateConfig updates the engine parameters safely in flight.
+func (e *Engine) UpdateConfig(newCfg Config) {
+	normalizeConfig(&newCfg)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg = newCfg
+	if newCfg.Seed != 0 {
+		e.rng = rand.New(rand.NewSource(newCfg.Seed))
+	}
+}
+
+// GetConfig returns a copy of current engine parameters.
+func (e *Engine) GetConfig() Config {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg
+}
+
+// Reset rewinds the internal PRNG stream back to the initial seed.
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.rng.Seed(e.cfg.Seed)
 }
 
-// Evaluate determines the exact fault to apply for a given byte chunk length.
+// Snapshot returns atomic telemetry values.
+func (e *Engine) Snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		BytesForwarded:  e.Metrics.BytesForwarded.Load(),
+		ActiveConns:     e.Metrics.ActiveConns.Load(),
+		TotalConns:      e.Metrics.TotalConns.Load(),
+		ChunksEvaluated: e.Metrics.ChunksEvaluated.Load(),
+		Passes:          e.Metrics.Passes.Load(),
+		Drops:           e.Metrics.Drops.Load(),
+		Corruptions:     e.Metrics.Corruptions.Load(),
+		Delays:          e.Metrics.Delays.Load(),
+		Fragments:       e.Metrics.Fragments.Load(),
+	}
+}
+
+// Evaluate calculates which fault action applies to an incoming byte chunk.
 func (e *Engine) Evaluate(chunkLen int) Decision {
 	e.Metrics.ChunksEvaluated.Add(1)
 	if chunkLen <= 0 {
@@ -110,18 +160,17 @@ func (e *Engine) Evaluate(chunkLen int) Decision {
 	roll := e.rng.Float64()
 	cursor := e.cfg.DropRate
 
-	// 1. Check Connection Drop
+	// 1. Connection Drop (TCP RST)
 	if roll < cursor {
 		e.Metrics.Drops.Add(1)
 		return Decision{Action: ActionDrop}
 	}
 
-	// 2. Check Bit-Level Payload Corruption
+	// 2. Bitwise Payload Corruption
 	cursor += e.cfg.CorruptRate
 	if roll < cursor {
 		offset := e.rng.Intn(chunkLen)
-		// Flip 1 random bit (bits 0-6 so ASCII characters stay printable/visible in demos)
-		bit := e.rng.Intn(7)
+		bit := e.rng.Intn(7) // Bits 0-6 keep printable ASCII visible
 		e.Metrics.Corruptions.Add(1)
 		return Decision{
 			Action:        ActionCorrupt,
@@ -130,7 +179,7 @@ func (e *Engine) Evaluate(chunkLen int) Decision {
 		}
 	}
 
-	// 3. Check Latency Jitter Injection
+	// 3. Latency Jitter
 	cursor += e.cfg.DelayRate
 	if roll < cursor {
 		delay := e.cfg.MinDelay
@@ -144,7 +193,7 @@ func (e *Engine) Evaluate(chunkLen int) Decision {
 		}
 	}
 
-	// 4. Check TCP Packet Fragmentation
+	// 4. TCP Packet Slicing (Fragmentation)
 	cursor += e.cfg.FragmentRate
 	if chunkLen > 1 && roll < cursor {
 		split := 1 + e.rng.Intn(chunkLen-1)
@@ -156,7 +205,7 @@ func (e *Engine) Evaluate(chunkLen int) Decision {
 		}
 	}
 
-	// 5. Healthy Pass-Through
+	// 5. Normal Forwarding
 	e.Metrics.Passes.Add(1)
 	return Decision{Action: ActionPass}
 }

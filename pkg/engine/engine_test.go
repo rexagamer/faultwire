@@ -60,3 +60,38 @@ func TestThreadSafetyUnderConcurrency(t *testing.T) {
 		t.Fatalf("expected 5000 chunks evaluated, got %d", got)
 	}
 }
+
+func FuzzEngineEvaluate(f *testing.F) {
+	f.Add(0)
+	f.Add(1)
+	f.Add(2)
+	f.Add(64)
+	f.Add(32768)
+
+	eng := New(Config{
+		Seed:         1337,
+		DropRate:     0.2,
+		CorruptRate:  0.2,
+		DelayRate:    0.2,
+		FragmentRate: 0.2,
+		MinDelay:     5 * time.Millisecond,
+		MaxDelay:     15 * time.Millisecond,
+	})
+
+	f.Fuzz(func(t *testing.T, chunkLen int) {
+		dec := eng.Evaluate(chunkLen)
+		if chunkLen <= 0 && dec.Action != ActionPass {
+			t.Fatalf("expected ActionPass for chunkLen <= 0, got %v", dec.Action)
+		}
+		if dec.Action == ActionCorrupt && chunkLen > 0 {
+			if dec.CorruptOffset < 0 || dec.CorruptOffset >= chunkLen {
+				t.Fatalf("corrupt offset out of bounds: offset=%d len=%d", dec.CorruptOffset, chunkLen)
+			}
+		}
+		if dec.Action == ActionFragment && chunkLen > 1 {
+			if dec.SplitOffset <= 0 || dec.SplitOffset >= chunkLen {
+				t.Fatalf("split offset out of bounds: split=%d len=%d", dec.SplitOffset, chunkLen)
+			}
+		}
+	})
+}

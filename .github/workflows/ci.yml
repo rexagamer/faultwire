@@ -2,34 +2,39 @@
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
 jobs:
-  test-and-build:
-    name: Go Test & Build
-    runs-on: ubuntu-latest
+  test:
+    name: Test (Go ${{ matrix.go-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.22', '1.23']
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go 1.22
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
 
-      - name: Verify dependencies
-        run: go mod verify
+      - name: Verify zero external dependencies
+        shell: bash
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
-      - name: Run unit tests with race detector
+      - name: Run unit & race tests
         run: go test -v -race ./...
 
-      - name: Build FaultWire CLI and Chaos Arena
-        run: |
-          go build -v ./cmd/faultwire
-          go build -v ./cmd/arena
-
-      - name: Execute Chaos Arena Determinism Check
-        run: go run ./cmd/arena/main.go
+      - name: Run engine fuzz testing
+        shell: bash
+        run: go test -v -fuzz=FuzzEngineEvaluate -fuzztime=10s ./pkg/engine

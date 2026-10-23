@@ -9,8 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rexagamer/faultwire/pkg/engine"
-	"github.com/rexagamer/faultwire/pkg/proxy"
+	"github.com/rexagamer/faultwire"
 )
 
 type TradeOrder struct {
@@ -24,28 +23,27 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. Start Mock Financial Exchange Backend
 	backendAddr, err := startMockExchange(ctx)
 	if err != nil {
 		panic(err)
 	}
 
-	// 2. Configure FaultWire with aggressive chaos & Seed 42
-	eng := engine.New(engine.Config{
+	eng := faultwire.NewEngine(faultwire.Config{
 		Seed:         42,
-		DropRate:     0.20, // 20% hard TCP RST drops
-		CorruptRate:  0.25, // 25% bit-flip payload corruption
-		DelayRate:    0.25, // 25% latency spikes (150ms - 300ms)
-		FragmentRate: 0.10, // 10% TCP packet slicing
+		DropRate:     0.20,
+		CorruptRate:  0.25,
+		DelayRate:    0.25,
+		FragmentRate: 0.10,
 		MinDelay:     150 * time.Millisecond,
 		MaxDelay:     300 * time.Millisecond,
 	})
 
-	srv, err := proxy.New(proxy.Config{
-		ListenAddr:   "127.0.0.1:0", // OS picks a free port automatically
+	srv, err := faultwire.NewServer(faultwire.ServerConfig{
+		ListenAddr:   "127.0.0.1:0",
 		UpstreamAddr: backendAddr,
+		Inbound:      eng,
 		Verbose:      false,
-	}, eng)
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -53,27 +51,24 @@ func main() {
 	go func() {
 		_ = srv.Start(ctx)
 	}()
-	time.Sleep(50 * time.Millisecond) // Wait for listener bind
+	time.Sleep(50 * time.Millisecond)
 	proxyAddr := srv.Addr()
 
 	fmt.Println("==========================================================================================")
-	fmt.Println("   FAULTWIRE CHAOS ARENA: HIGH-FREQUENCY TRADING RESILIENCE & DETERMINISM SIMULATOR")
+	fmt.Println("    FAULTWIRE CHAOS ARENA: HIGH-FREQUENCY TRADING RESILIENCE & DETERMINISM SIMULATOR")
 	fmt.Println("==========================================================================================")
 	fmt.Printf("Backend Exchange : %s\n", backendAddr)
 	fmt.Printf("FaultWire Proxy  : %s (Seed: 42 | Drop: 20%% | Corrupt: 25%% | Delay: 25%%)\n\n", proxyAddr)
 
-	// 3. Execute Run #1
 	fmt.Println(">>> EXECUTING RUN #1 (SEED 42)")
 	fmt.Println("------------------------------------------------------------------------------------------")
 	resultsRun1 := runSimulation(proxyAddr, 12)
 
-	// 4. Reset Seed to 42 and Execute Run #2
 	eng.Reset()
 	fmt.Println("\n>>> REPLAYING RUN #2 WITH IDENTICAL SEED (SEED 42)")
 	fmt.Println("------------------------------------------------------------------------------------------")
 	resultsRun2 := runSimulation(proxyAddr, 12)
 
-	// 5. Verify Determinism
 	fmt.Println("\n==========================================================================================")
 	identical := true
 	for i := range resultsRun1 {
@@ -142,7 +137,6 @@ func runSimulation(proxyAddr string, count int) []string {
 	return outcomes
 }
 
-// startMockExchange starts a TCP server that parses JSON trade orders and reports bit corruption.
 func startMockExchange(ctx context.Context) (string, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -168,12 +162,10 @@ func startMockExchange(ctx context.Context) (string, error) {
 				}
 				var order TradeOrder
 				if err := json.Unmarshal(rawLine, &order); err != nil {
-					// JSON syntax was broken by a bit-flip!
 					msg := fmt.Sprintf("ERR_CORRUPT: JSON Parse Failed -> Raw Wire Bytes: %s\n", strings.TrimSpace(string(rawLine)))
 					_, _ = c.Write([]byte(msg))
 					return
 				}
-				// Check if fields inside valid JSON were mutated by a bit-flip
 				if order.Symbol != "BTC-USD" || order.Action != "BUY" {
 					msg := fmt.Sprintf("ERR_CORRUPT: Silent Data Mutation! Symbol=%q Action=%q\n", order.Symbol, order.Action)
 					_, _ = c.Write([]byte(msg))
