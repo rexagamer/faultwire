@@ -15,6 +15,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go-version: ['1.22', '1.23']
+        exclude:
+          # macOS 15+ (Apple Silicon) dyld requires LC_UUID headers in Mach-O binaries.
+          # Go 1.22 internal linker omitted it; Go 1.23+ contains the upstream fix.
+          - os: macos-latest
+            go-version: '1.22'
 
     steps:
       - name: Checkout code
